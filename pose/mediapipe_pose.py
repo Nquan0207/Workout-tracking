@@ -42,7 +42,7 @@ class MediaPipePoseEstimator:
 
     def infer(self, frame_bgr, timestamp_ms: Optional[int] = None) -> Optional[PoseResult]:
         h, w = frame_bgr.shape[:2]
-        rgb = frame_bgr[:, :, ::-1]
+        rgb = np.ascontiguousarray(frame_bgr[:, :, ::-1])
         image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         if self.static_image_mode:
             out = self.model.detect(image)
