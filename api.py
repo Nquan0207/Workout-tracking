@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
+import os
 import secrets
 import threading
 import time
@@ -18,6 +20,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .exercises.specs import SPECS
+
 BASE_DIR = Path(__file__).resolve().parents[1]
 ARTIFACTS_DIR = BASE_DIR / "api_artifacts"
 UI_DIR = BASE_DIR / "ui"
@@ -26,6 +29,38 @@ ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 UI_DIR.mkdir(parents=True, exist_ok=True)
 
 Exercise = Literal["squat", "pushup", "bicep_curl", "pullup"]
+logger = logging.getLogger("workout.api")
+
+
+def _load_dotenv(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip().strip("'").strip('"')
+        os.environ.setdefault(key, value)
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+_load_dotenv(BASE_DIR / ".env")
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "").strip()
+MAX_WS_FRAME_BYTES = _env_int("MAX_WS_FRAME_BYTES", 2_000_000)
+WS_LOG_EVERY_N_FRAMES = max(1, _env_int("WS_LOG_EVERY_N_FRAMES", 30))
 
 
 class LoginRequest(BaseModel):
@@ -162,10 +197,18 @@ CONFIG_VERSION = hashlib.sha1(json.dumps(SPECS, sort_keys=True).encode("utf-8"))
 CONFIG_UPDATED_AT = datetime.now(timezone.utc).isoformat()
 
 app = FastAPI(title="Workout Monitor Mobile Backend", version="2.0.0")
+CORS_ALLOWED_ORIGINS_RAW = os.getenv("CORS_ALLOWED_ORIGINS", "*").strip()
+if CORS_ALLOWED_ORIGINS_RAW == "*":
+    cors_allow_origins = ["*"]
+    cors_allow_credentials = False
+else:
+    cors_allow_origins = [o.strip() for o in CORS_ALLOWED_ORIGINS_RAW.split(",") if o.strip()]
+    cors_allow_credentials = True
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=cors_allow_origins,
+    allow_credentials=cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -177,6 +220,14 @@ def home() -> FileResponse:
     if not index_path.exists():
         raise HTTPException(status_code=404, detail="ui/index.html not found")
     return FileResponse(index_path)
+
+
+@app.get("/live_test.html")
+def live_test() -> FileResponse:
+    live_test_path = UI_DIR / "live_test.html"
+    if not live_test_path.exists():
+        raise HTTPException(status_code=404, detail="ui/live_test.html not found")
+    return FileResponse(live_test_path)
 
 
 @app.get("/health")
@@ -191,7 +242,18 @@ def login(body: LoginRequest) -> LoginResponse:
     return store.login(body.username)
 
 
-def current_user(authorization: str = Header(default="")) -> Dict[str, str]:
+def _is_internal_api_key_valid(raw_key: str) -> bool:
+    if not INTERNAL_API_KEY:
+        return False
+    return secrets.compare_digest(raw_key.strip(), INTERNAL_API_KEY)
+
+
+def current_user(
+    authorization: str = Header(default=""),
+    x_internal_key: str = Header(default="", alias="X-Internal-Key"),
+) -> Dict[str, str]:
+    if _is_internal_api_key_valid(x_internal_key):
+        return {"user_id": "internal_service", "username": "internal_service"}
     if not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="missing bearer token")
     token = authorization.split(" ", 1)[1].strip()
@@ -201,6 +263,15 @@ def current_user(authorization: str = Header(default="")) -> Dict[str, str]:
 
 
 def _authorize_ws(websocket: WebSocket) -> Dict[str, str]:
+    # Browser WebSocket cannot set arbitrary headers, so allow query-param auth
+    # for local testing (token/internal_key) in addition to header-based auth.
+    if _is_internal_api_key_valid(websocket.headers.get("x-internal-key", "")):
+        return {"user_id": "internal_service", "username": "internal_service"}
+    if _is_internal_api_key_valid(websocket.query_params.get("internal_key", "")):
+        return {"user_id": "internal_service", "username": "internal_service"}
+    query_token = (websocket.query_params.get("token", "") or "").strip()
+    if query_token:
+        return store.authenticate(query_token)
     auth = websocket.headers.get("authorization", "")
     if not auth.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="missing bearer token")
@@ -215,14 +286,23 @@ async def live_ws(
     websocket: WebSocket,
     exercise: Exercise = Query("pushup"),
     overlay: bool = Query(True),
+    landmarks: bool = Query(True),
 ) -> None:
+    ws_start = time.perf_counter()
     try:
-        _authorize_ws(websocket)
+        user = _authorize_ws(websocket)
     except HTTPException:
         await websocket.close(code=4401)
         return
 
     await websocket.accept()
+    logger.info(
+        "live_ws connected exercise=%s user=%s overlay=%s landmarks=%s",
+        exercise,
+        user.get("user_id"),
+        overlay,
+        landmarks,
+    )
     try:
         from .pipeline.analyze import Analyzer
         from .pipeline.overlay import draw_hud, draw_pose
@@ -236,34 +316,54 @@ async def live_ws(
     frame_idx = 0
     fps = 30.0
 
+    def _elapsed_ms(start: float) -> int:
+        return int((time.perf_counter() - start) * 1000)
+
     try:
         while True:
+            frame_started_at = time.perf_counter()
             msg = await websocket.receive()
             if msg.get("type") == "websocket.disconnect":
                 break
             payload = msg.get("bytes")
             if not payload:
                 continue
+            if len(payload) > MAX_WS_FRAME_BYTES:
+                await websocket.send_json(
+                    {
+                        "error": "frame_too_large",
+                        "max_ws_frame_bytes": MAX_WS_FRAME_BYTES,
+                    }
+                )
+                continue
 
+            decode_started_at = time.perf_counter()
             arr = np.frombuffer(payload, dtype=np.uint8)
             frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            decode_ms = _elapsed_ms(decode_started_at)
             if frame is None:
                 await websocket.send_json({"error": "invalid_frame"})
                 continue
 
             display = frame.copy()
+            pose_started_at = time.perf_counter()
             pose = analyzer.pose.infer(frame, timestamp_ms=int(round(frame_idx * 1000.0 / fps)))
+            pose_inference_ms = _elapsed_ms(pose_started_at)
             frame_idx += 1
 
             if pose is None:
+                overlay_encode_ms = 0
                 if overlay:
                     draw_hud(display, ["No person detected", f"Reps: {analyzer.counter.s.reps}"])
+                    overlay_started_at = time.perf_counter()
                     ok, encoded = cv2.imencode(".jpg", display, [int(cv2.IMWRITE_JPEG_QUALITY), 72])
+                    overlay_encode_ms = _elapsed_ms(overlay_started_at)
                     overlay_jpeg = (
                         f"data:image/jpeg;base64,{base64.b64encode(encoded.tobytes()).decode('ascii')}" if ok else None
                     )
                 else:
                     overlay_jpeg = None
+                processing_ms = _elapsed_ms(frame_started_at)
                 await websocket.send_json(
                     {
                         "exercise": exercise,
@@ -272,11 +372,29 @@ async def live_ws(
                         "form_status": "observing",
                         "violations": [],
                         "metrics": {},
+                        "perf": {
+                            "decode_ms": decode_ms,
+                            "pose_inference_ms": pose_inference_ms,
+                            "overlay_encode_ms": overlay_encode_ms,
+                            "server_processing_ms": processing_ms,
+                        },
                         "overlay_jpeg": overlay_jpeg,
                     }
                 )
+                if frame_idx % WS_LOG_EVERY_N_FRAMES == 0:
+                    logger.info(
+                        "live_ws perf exercise=%s reps=%s state=%s decode_ms=%s pose_inference_ms=%s overlay_encode_ms=%s server_processing_ms=%s",
+                        exercise,
+                        analyzer.counter.s.reps,
+                        analyzer.counter.s.state,
+                        decode_ms,
+                        pose_inference_ms,
+                        overlay_encode_ms,
+                        processing_ms,
+                    )
                 continue
 
+            analysis_started_at = time.perf_counter()
             kps = analyzer.smoother.smooth(pose.keypoints)
             angles = analyzer._angles(kps)
             counter_snapshot = analyzer.counter.update(kps, angles)
@@ -291,18 +409,24 @@ async def live_ws(
                 context={"state": counter_snapshot.get("state")},
             )
             form = analyzer._feedback_assessment(counter_snapshot, rule_flags)
+            analysis_ms = _elapsed_ms(analysis_started_at)
 
+            overlay_encode_ms = 0
             if overlay:
                 text_lines = analyzer._overlay_lines(counter_snapshot, form)
-                display = draw_pose(display, kps)
+                if landmarks:
+                    display = draw_pose(display, kps)
                 display = draw_hud(display, text_lines, org=(10, 30))
+                overlay_started_at = time.perf_counter()
                 ok, encoded = cv2.imencode(".jpg", display, [int(cv2.IMWRITE_JPEG_QUALITY), 72])
+                overlay_encode_ms = _elapsed_ms(overlay_started_at)
                 overlay_jpeg = (
                     f"data:image/jpeg;base64,{base64.b64encode(encoded.tobytes()).decode('ascii')}" if ok else None
                 )
             else:
                 overlay_jpeg = None
 
+            processing_ms = _elapsed_ms(frame_started_at)
             await websocket.send_json(
                 {
                     "exercise": exercise,
@@ -311,12 +435,33 @@ async def live_ws(
                     "form_status": form["form_status"],
                     "violations": form["violations"],
                     "metrics": {k: round(float(v), 2) for k, v in metrics.items()},
+                    "perf": {
+                        "decode_ms": decode_ms,
+                        "pose_inference_ms": pose_inference_ms,
+                        "analysis_ms": analysis_ms,
+                        "overlay_encode_ms": overlay_encode_ms,
+                        "server_processing_ms": processing_ms,
+                    },
                     "overlay_jpeg": overlay_jpeg,
                 }
             )
+            if frame_idx % WS_LOG_EVERY_N_FRAMES == 0:
+                logger.info(
+                    "live_ws perf exercise=%s reps=%s state=%s decode_ms=%s pose_inference_ms=%s analysis_ms=%s overlay_encode_ms=%s server_processing_ms=%s",
+                    exercise,
+                    counter_snapshot["reps"],
+                    counter_snapshot["state"],
+                    decode_ms,
+                    pose_inference_ms,
+                    analysis_ms,
+                    overlay_encode_ms,
+                    processing_ms,
+                )
     except WebSocketDisconnect:
-        pass
+        logger.info("live_ws disconnected exercise=%s user=%s", exercise, user.get("user_id"))
     finally:
+        session_ms = int((time.perf_counter() - ws_start) * 1000)
+        logger.info("live_ws closed exercise=%s user=%s duration_ms=%s", exercise, user.get("user_id"), session_ms)
         try:
             analyzer.pose.close()
         except Exception:
